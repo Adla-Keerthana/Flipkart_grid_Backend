@@ -1,80 +1,85 @@
-from fastapi import APIRouter, HTTPException, UploadFile, File
-from models.response_models import ExpiryResponse
+import easyocr
+import cv2
 import re
-from paddleocr import PaddleOCR
-from io import BytesIO
-from PIL import Image
+from datetime import datetime
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from pydantic import BaseModel
 import numpy as np
-import logging
 
-# Initialize logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+app = FastAPI()
 
-# Initialize PaddleOCR
-ocr = PaddleOCR(use_angle_cls=True, lang='en')
+# Pydantic model for the response
+class ExpiryResponse(BaseModel):
+    expiry_date: str
 
-router = APIRouter()
-
-# Function to extract expiry date from text
-def extract_expiry_date_from_text(text: str) -> str:
-    # List of regex patterns to capture various date formats
+# Function to extract dates from text using various formats
+def extract_dates_from_text(text: str):
     date_patterns = [
-        # dd-mm-yyyy or dd/mm/yyyy
-        r'\b(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\b',
-        # dd Mon yyyy (e.g., 01 Jan 2024)
-        r'\b(\d{1,2} \w{3} \d{2,4})\b',
-        # Mon dd, yyyy (e.g., Jan 01, 2024)
-        r'\b(\w{3} \d{1,2}, \d{2,4})\b',
-        # yyyy-mm-dd or yyyy/mm/dd
-        r'\b(\d{4}[-/]\d{1,2}[-/]\d{1,2})\b',
-        # mm-dd-yyyy or mm/dd/yyyy
-        r'\b(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\b',
-        # Full date formats (e.g., January 1, 2024)
-        r'\b([A-Za-z]+ \d{1,2}, \d{4})\b',
-        # Full month-day-year (e.g., 1st January 2024)
-        r'\b(\d{1,2}(st|nd|rd|th) [A-Za-z]+ \d{4})\b',
-        # ISO format (e.g., 2024-01-01)
-        r'\b(\d{4}-\d{2}-\d{2})\b',
-        # Additional formats can be added here
+        r'\b(?:\d{1,2}[-/\s]?\d{1,2}[-/\s]?\d{2,4})\b',  # dd-mm-yyyy or dd/mm/yyyy
+        r'\b(?:\d{4}[-/\s]?\d{1,2}[-/\s]?\d{1,2})\b',      # yyyy-mm-dd or yyyy/mm/dd
+        r'\b(?:\d{1,2}\s?\w{3,9}\s?\d{2,4})\b',            # dd Month yyyy
+        r'\b(?:\w{3,9}\s?\d{1,2}[,\s]?\d{2,4})\b',         # Month dd, yyyy
     ]
     
+    matches = []
     for pattern in date_patterns:
-        match = re.search(pattern, text)
-        if match:
-            return match.group(0)
+        matches.extend(re.findall(pattern, text))
+    
+    return matches
 
-    return "No expiry date found."
+# Function to parse and compare dates
+def get_expiry_date(dates):
+    parsed_dates = []
+
+    for date in dates:
+        date = date.replace(" ", "")  # Remove all spaces for consistent parsing
+        try:
+            if '/' in date or '-' in date:
+                if len(date.split('/')) == 3:
+                    parsed_date = datetime.strptime(date, "%Y/%m/%d")
+                else:
+                    parsed_date = datetime.strptime(date, "%d-%m-%Y") if len(date.split('-')[-1]) == 4 else datetime.strptime(date, "%d-%m-%y")
+            elif ' ' in date:
+                parsed_date = datetime.strptime(date, "%d %b %Y") if len(date.split()[-1]) == 4 else datetime.strptime(date, "%d %B %Y")
+        except ValueError:
+            continue
+
+    return max(parsed_dates) if parsed_dates else None
 
 # Service function to process the image and extract the expiry date
 async def extract_expiry_date(image_file: UploadFile) -> str:
-    # Load the image using PIL
     try:
-        image = Image.open(image_file.file).convert("RGB")
-        logger.info("Image loaded successfully.")
+        # Read the image using OpenCV
+        image = cv2.imdecode(np.frombuffer(await image_file.read(), np.uint8), cv2.IMREAD_COLOR)
+        
+        # Convert image to grayscale
+        gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+        # Apply thresholding
+        _, thresh_image = cv2.threshold(gray_image, 150, 255, cv2.THRESH_BINARY_INV)
+
+        # Initialize EasyOCR reader
+        reader = easyocr.Reader(['en'])
+        
+        # Use EasyOCR to do OCR on the image
+        results = reader.readtext(thresh_image)
+
+        # Combine results into a single text
+        extracted_text = ' '.join([result[1] for result in results])
+
+        # Extract all dates from the text
+        dates = extract_dates_from_text(extracted_text)
+        
+        # Determine the expiry date from the extracted dates
+        expiry_date = get_expiry_date(dates)
+
+        if expiry_date:
+            return expiry_date.strftime("%d %b %Y")  # Return in desired format
+        return "No expiry date found."
     except Exception as e:
-        logger.error(f"Failed to load image: {str(e)}")
-        raise HTTPException(status_code=400, detail="Invalid image file.")
+        raise HTTPException(status_code=500, detail=str(e))
 
-    # Perform OCR on the image
-    try:
-        # Convert image to a format suitable for PaddleOCR
-        image_np = np.array(image)
-        result = ocr.ocr(image_np, cls=True)
-        logger.info("OCR processing completed successfully.")
-    except Exception as e:
-        logger.error(f"OCR processing failed: {str(e)}")
-        raise HTTPException(status_code=500, detail="OCR processing failed.")
-
-    # Combine all detected texts into a single string
-    extracted_text = " ".join(word_info[1][0] for line in result for word_info in line)
-    logger.info(f"Extracted text: {extracted_text}")
-
-    # Extract the expiry date from the combined text
-    expiry_date = extract_expiry_date_from_text(extracted_text)
-    return expiry_date
-
-@router.post("/expiry-extraction", response_model=ExpiryResponse)
+@app.post("/expiry-extraction", response_model=ExpiryResponse)
 async def expiry_extraction(image_file: UploadFile = File(...)):
     try:
         if not image_file.content_type.startswith('image/'):
@@ -83,7 +88,6 @@ async def expiry_extraction(image_file: UploadFile = File(...)):
         expiry_date = await extract_expiry_date(image_file)
         return ExpiryResponse(expiry_date=expiry_date)
     except HTTPException as http_ex:
-        raise http_ex  # Preserve HTTP exceptions
+        raise http_ex
     except Exception as e:
-        logger.error(f"Error in expiry extraction: {str(e)}")
         raise HTTPException(status_code=500, detail=f"An internal error occurred: {str(e)}")
